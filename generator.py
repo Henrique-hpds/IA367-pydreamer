@@ -15,6 +15,7 @@ import mlflow
 import numpy as np
 import torch
 import torch.distributions as D
+from tqdm import tqdm
 
 from pydreamer.data import MlflowEpisodeRepository
 from pydreamer.envs import create_env
@@ -90,6 +91,11 @@ def main(env_id='MiniGrid-MazeS11N-v0',
     metrics_agg = defaultdict(list)
     all_returns = []
     steps = 0
+    
+    # Create progress bar
+    pbar = tqdm(total=num_steps, desc=f"[GEN {worker_id}] Progress", unit="steps", 
+                initial=steps_saved, dynamic_ncols=True, 
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
     while steps_saved < num_steps:
 
@@ -254,8 +260,13 @@ def main(env_id='MiniGrid-MazeS11N-v0',
 
             if repo == repository:
                 # Only count steps in the training repo, so that prefill and limit_step_ratio works correctly
+                old_steps_saved = steps_saved
                 steps_saved += datas_steps
+                # Update progress bar
+                pbar.update(steps_saved - old_steps_saved)
+                pbar.set_postfix({'episodes': episodes, 'reward': f'{all_returns[-1] if all_returns else 0:.1f}'})
 
+    pbar.close()
     info('Generator done.')
 
 

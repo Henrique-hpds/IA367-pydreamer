@@ -1,8 +1,15 @@
 # Ignore annoying warnings from imported envs
 import warnings
 warnings.filterwarnings("ignore", ".*Box bound precision lowered by casting")  # gym
-
-import gym
+try:
+    import gymnasium as gym
+    GYM_BACKEND = 'gymnasium'
+except Exception:
+    try:
+        import gym
+        GYM_BACKEND = 'gym'
+    except Exception:
+        raise RuntimeError("Neither 'gymnasium' nor 'gym' is installed. Install one of them.")
 import numpy as np
 
 from .wrappers import *

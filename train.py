@@ -12,6 +12,7 @@ from torch import Tensor
 from torch.cuda.amp import GradScaler, autocast
 from torch.profiler import ProfilerActivity
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from pydreamer import tools
 from pydreamer.data import DataSequential, MlflowEpisodeRepository
@@ -141,12 +142,33 @@ def run(conf):
                                 pin_memory=True))
 
     scaler = GradScaler(enabled=conf.amp)
+    
+    # Create progress bar for training
+    # Use n_env_steps if available (more intuitive), otherwise fall back to n_steps
+    # For Atari: typically 5M env steps, not 100M gradient steps
+    if hasattr(conf, 'n_env_steps') and conf.n_env_steps:
+        # Estimate gradient steps from env steps (rough approximation)
+        # Typically train_ratio=256 (one gradient step per 256 env steps collected)
+        train_ratio = getattr(conf, 'train_ratio', 256)
+        estimated_grad_steps = conf.n_env_steps // train_ratio
+        total_for_bar = estimated_grad_steps
+        desc = f"[TRAIN] Training (target: {conf.n_env_steps/1_000_000:.1f}M env steps)"
+    else:
+        total_for_bar = min(conf.n_steps, 1_000_000)  # Cap at 1M for display
+        desc = "[TRAIN] Training"
+    
+    train_pbar = tqdm(total=total_for_bar, desc=desc, unit="step", 
+                     initial=min(steps, total_for_bar), dynamic_ncols=True,
+                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
     with get_profiler(conf) as profiler:
         while True:
             with timer('total'):
                 profiler.step()
                 steps += 1
+                # Only update progress bar if we haven't exceeded the estimated total
+                if steps <= total_for_bar:
+                    train_pbar.update(1)
                 will_log_batch = steps % conf.logbatch_interval == 1
                 will_image_pred = (
                     will_log_batch or
@@ -227,6 +249,7 @@ def run(conf):
                         metrics['data_steps'].append(data_train_stats.stats_steps)
                         metrics['data_env_steps'].append(data_train_stats.stats_steps * conf.env_action_repeat)
                         if data_train_stats.stats_steps * conf.env_action_repeat >= conf.n_env_steps:
+                            train_pbar.close()
                             info(f'Finished {conf.n_env_steps} env steps.')
                             return
 
@@ -252,6 +275,11 @@ def run(conf):
                              f"  policy_entropy: {metrics.get('train/policy_entropy',0):.3f}"
                              f"  fps: {metrics['train/fps']:.3f}"
                              )
+                        # Update progress bar with metrics
+                        train_pbar.set_postfix({
+                            'loss': f"{metrics.get('train/loss_model', 0):.3f}",
+                            'fps': f"{metrics['train/fps']:.1f}"
+                        })
                         if steps > conf.log_interval:  # Skip the first batch, because the losses are very high and mess up y axis
                             mlflow_log_metrics(metrics, step=steps)
                         metrics = defaultdict(list)
@@ -266,6 +294,7 @@ def run(conf):
                     # Stop
 
                     if steps >= conf.n_steps:
+                        train_pbar.close()
                         info(f'Finished {conf.n_steps} grad steps.')
                         return
 

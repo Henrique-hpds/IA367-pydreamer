@@ -51,11 +51,11 @@ class ActionRewardResetWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
-        if isinstance(action, int):
+        if isinstance(action, (int, np.integer)):
             action_vec = np.zeros(self.action_size)
             action_vec[action] = 1.0
         else:
-            assert isinstance(action, np.ndarray) and action.shape == (self.action_size,), "Wrong one-hot action shape"
+            assert isinstance(action, np.ndarray) and action.shape == (self.action_size,), f"Wrong one-hot action shape: type={type(action)}, value={action}, expected_shape=({self.action_size},)"
             action_vec = action
         obs['action'] = action_vec
         obs['reward'] = np.array(reward)
