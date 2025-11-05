@@ -6,6 +6,10 @@ autorom
 opencv-python
 tqdm
 backoff
+jupyter
+ipykernel
+notebook
+holoviews
 
 # Logging
 mlflow
