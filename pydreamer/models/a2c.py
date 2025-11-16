@@ -21,7 +21,10 @@ class ActorCritic(nn.Module):
                  entropy_weight=1e-3,
                  target_interval=100,
                  actor_grad='reinforce',
-                 actor_dist='onehot'
+                 actor_dist='onehot',
+                 use_vtrace=False,
+                 vtrace_rho_clip=1.0,
+                 vtrace_c_clip=1.0,
                  ):
         super().__init__()
         self.in_dim = in_dim
@@ -32,6 +35,9 @@ class ActorCritic(nn.Module):
         self.target_interval = target_interval
         self.actor_grad = actor_grad
         self.actor_dist = actor_dist
+        self.use_vtrace = use_vtrace
+        self.rho_clip = vtrace_rho_clip
+        self.c_clip = vtrace_c_clip
 
         actor_out_dim = out_actions if actor_dist == 'onehot' else 2 * out_actions
         self.actor = MLP(in_dim, actor_out_dim, hidden_dim, hidden_layers, layer_norm)
@@ -58,12 +64,53 @@ class ActorCritic(nn.Module):
         y = self.critic.forward(features)
         return y
 
+    def compute_vtrace(self,
+                       policy_logprobs: TensorHM,
+                       behavior_logprobs: TensorHM,
+                       rewards: TensorHM,
+                       values: TensorHM,
+                       next_values: TensorHM,
+                       terminals: TensorHM,
+                       ) -> Tuple[Tensor, Tensor]:
+        
+        # Importance sampling ratios
+        log_rhos = policy_logprobs - behavior_logprobs
+        rhos = torch.exp(log_rhos)
+        
+        # Clipped importance sampling for value function
+        cs = torch.clamp(rhos, max=self.c_clip)
+        
+        # Clipped importance sampling for policy gradient
+        clipped_rhos = torch.clamp(rhos, max=self.rho_clip)
+        
+        # Temporal difference errors
+        deltas = clipped_rhos * (rewards + self.gamma * (1.0 - terminals) * next_values - values)
+        
+        # V-trace targets computed backward
+        vs = []
+        vs_next = next_values[-1]  # Bootstrap from last value
+        
+        for i in reversed(range(len(deltas))):
+            vs_t = values[i] + deltas[i] + self.gamma * (1.0 - terminals[i]) * cs[i] * (vs_next - next_values[i])
+            vs.append(vs_t)
+            vs_next = vs_t
+            
+        vs.reverse()
+        vs = torch.stack(vs)
+        
+        # V-trace advantage: A_t = ρ̄_t * (r_t + γ * vs_{t+1} - V(s_t))
+        vs_next_shifted = torch.cat([vs[1:], next_values[-1:]])  # vs_{t+1}
+        advantages = clipped_rhos * (rewards + self.gamma * (1.0 - terminals) * vs_next_shifted - values)
+        
+        return vs, advantages
+
     def training_step(self,
                       features: TensorJMF,
                       actions: TensorHMA,
                       rewards: TensorJM,
                       terminals: TensorJM,
-                      log_only=False
+                      log_only=False,
+                      behavior_logprobs: Optional[TensorHM] = None
                       ):
         """
         The ordering is as follows:
@@ -72,6 +119,10 @@ class ActorCritic(nn.Module):
             -> actions[1] -> ...
             ...
             -> actions[H-1] -> rewards[H], terminals[H], features[H]
+            
+        Args:
+            behavior_logprobs: Log probs of actions under behavior policy (for V-trace)
+                              If None and use_vtrace=True, assumes on-policy (behavior=current policy)
         """
         if not log_only:
             if self.train_steps % self.target_interval == 0:
@@ -82,25 +133,64 @@ class ActorCritic(nn.Module):
         terminal0: TensorHM = terminals[:-1]
         terminal1: TensorHM = terminals[1:]
 
-        # GAE from https://arxiv.org/abs/1506.02438 eq (16)
-        #   advantage_gae[t] = advantage[t] + (gamma lambda) advantage[t+1] + (gamma lambda)^2 advantage[t+2] + ...
-
         value_t: TensorJM = self.critic_target.forward(features)
         value0t: TensorHM = value_t[:-1]
         value1t: TensorHM = value_t[1:]
-        advantage = - value0t + reward1 + self.gamma * (1.0 - terminal1) * value1t
-        advantage_gae = []
-        agae = None
-        for adv, term in zip(reversed(advantage.unbind()), reversed(terminal1.unbind())):
-            if agae is None:
-                agae = adv
+        
+        # Compute policy distribution and log probs
+        policy_distr = self.forward_actor(features[:-1])
+        policy_logprobs = policy_distr.log_prob(actions)
+        
+        # Choose between V-trace and GAE
+        if self.use_vtrace:
+            # V-trace off-policy correction
+            if behavior_logprobs is None:
+                # If no behavior policy provided, assume on-policy (μ = π)
+                behavior_logprobs = policy_logprobs.detach()
+            
+            value_target, advantage_vtrace = self.compute_vtrace(
+                policy_logprobs=policy_logprobs.detach(),
+                behavior_logprobs=behavior_logprobs,
+                rewards=reward1,
+                values=value0t,
+                next_values=value1t,
+                terminals=terminal1
+            )
+            
+            # Apply GAE on top of V-trace for even smoother gradients
+            if self.lambda_ < 1.0:
+                # Compute residual TD errors after V-trace
+                td_errors = value_target - value0t
+                advantage_gae = []
+                agae = None
+                for td_err, term in zip(reversed(td_errors.unbind()), reversed(terminal1.unbind())):
+                    if agae is None:
+                        agae = td_err
+                    else:
+                        agae = td_err + self.lambda_ * self.gamma * (1.0 - term) * agae
+                    advantage_gae.append(agae)
+                advantage_gae.reverse()
+                advantage_gae = torch.stack(advantage_gae)
             else:
-                agae = adv + self.lambda_ * self.gamma * (1.0 - term) * agae
-            advantage_gae.append(agae)
-        advantage_gae.reverse()
-        advantage_gae = torch.stack(advantage_gae)
-        # Note: if lambda=0, then advantage_gae=advantage, then value_target = advantage + value0t = reward + gamma * value1t
-        value_target = advantage_gae + value0t
+                advantage_gae = advantage_vtrace
+                
+        else:
+            # Standard GAE
+            # GAE from https://arxiv.org/abs/1506.02438 eq (16)
+            #   advantage_gae[t] = advantage[t] + (gamma lambda) advantage[t+1] + (gamma lambda)^2 advantage[t+2] + ...
+            advantage = - value0t + reward1 + self.gamma * (1.0 - terminal1) * value1t
+            advantage_gae = []
+            agae = None
+            for adv, term in zip(reversed(advantage.unbind()), reversed(terminal1.unbind())):
+                if agae is None:
+                    agae = adv
+                else:
+                    agae = adv + self.lambda_ * self.gamma * (1.0 - term) * agae
+                advantage_gae.append(agae)
+            advantage_gae.reverse()
+            advantage_gae = torch.stack(advantage_gae)
+            # Note: if lambda=0, then advantage_gae=advantage, then value_target = advantage + value0t = reward + gamma * value1t
+            value_target = advantage_gae + value0t
 
         # When calculating losses, should ignore terminal states, or anything after, so:
         #   reality_weight[i] = (1-terminal[0]) (1-terminal[1]) ... (1-terminal[i])
@@ -116,10 +206,8 @@ class ActorCritic(nn.Module):
 
         # Actor loss
 
-        policy_distr = self.forward_actor(features[:-1])  # TODO: we could reuse this from dream()
         if self.actor_grad == 'reinforce':
-            action_logprob = policy_distr.log_prob(actions)
-            loss_policy = - action_logprob * advantage_gae.detach()
+            loss_policy = - policy_logprobs * advantage_gae.detach()
         elif self.actor_grad == 'dynamics':
             loss_policy = - value_target
         else:
@@ -131,6 +219,9 @@ class ActorCritic(nn.Module):
         assert (loss_policy.requires_grad and policy_entropy.requires_grad) or not loss_critic.requires_grad
 
         with torch.no_grad():
+            # Compute standard advantage for logging
+            advantage = - value0t + reward1 + self.gamma * (1.0 - terminal1) * value1t
+            
             metrics = dict(loss_critic=loss_critic.detach(),
                            loss_actor=loss_actor.detach(),
                            policy_entropy=policy_entropy.mean(),
@@ -139,6 +230,17 @@ class ActorCritic(nn.Module):
                            policy_reward=reward1.mean(),
                            policy_reward_std=reward1.std(),
                            )
+            
+            if self.use_vtrace and behavior_logprobs is not None:
+                # Log importance sampling statistics
+                log_rhos = policy_logprobs - behavior_logprobs
+                rhos = torch.exp(log_rhos)
+                metrics.update(
+                    vtrace_rho_mean=rhos.mean(),
+                    vtrace_rho_max=rhos.max(),
+                    vtrace_rho_clipped=(rhos > self.rho_clip).float().mean(),
+                )
+            
             tensors = dict(value=value.detach(),
                            value_target=value_target.detach(),
                            value_advantage=advantage.detach(),

@@ -40,6 +40,9 @@ class Dreamer(nn.Module):
                               target_interval=conf.target_interval,
                               actor_grad=conf.actor_grad,
                               actor_dist=conf.actor_dist,
+                              use_vtrace=conf.use_vtrace,
+                              vtrace_rho_clip=conf.vtrace_rho_clip,
+                              vtrace_c_clip=conf.vtrace_c_clip,
                               )
 
         # Map probe

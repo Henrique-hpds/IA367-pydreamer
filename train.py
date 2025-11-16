@@ -135,11 +135,17 @@ def run(conf):
         return timers[name]
 
     states = {}  # by worker
-    data_iter = iter(DataLoader(WorkerInfoPreprocess(preprocess(data)),
-                                batch_size=None,
-                                num_workers=conf.data_workers,
-                                prefetch_factor=20 if conf.data_workers else 2,  # GCS download has to be shorter than this many batches (e.g. 1sec < 20*300ms)
-                                pin_memory=True))
+    # Configure DataLoader with proper prefetch_factor handling
+    dataloader_kwargs = {
+        'batch_size': None,
+        'num_workers': conf.data_workers,
+        'pin_memory': True,
+    }
+    # Only set prefetch_factor if num_workers > 0
+    if conf.data_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = 20  # GCS download has to be shorter than this many batches
+    
+    data_iter = iter(DataLoader(WorkerInfoPreprocess(preprocess(data)), **dataloader_kwargs))
 
     scaler = GradScaler(enabled=conf.amp)
     

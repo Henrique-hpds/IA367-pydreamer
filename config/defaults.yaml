@@ -98,6 +98,13 @@ defaults:
   imag_horizon: 15
   actor_grad: reinforce
   actor_dist: onehot
+  
+  # V-trace (off-policy correction)
+  # Valores baseados no paper IMPALA (Espeholt et al., 2018)
+  # use_vtrace: True para ativar V-trace + GAE
+  use_vtrace: True
+  vtrace_rho_clip: 1.0    # Padrão IMPALA - balanceado
+  vtrace_c_clip: 1.0      # Padrão IMPALA - balanceado
 
   # Auxiliary Actor critic
   aux_critic: False
