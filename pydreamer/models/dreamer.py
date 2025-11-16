@@ -110,15 +110,7 @@ class Dreamer(nn.Module):
         metrics = dict(policy_value=value.detach().mean())
         return action_distr, out_state, metrics
 
-    def training_step(self,
-                      obs: Dict[str, Tensor],
-                      in_state: Any,
-                      iwae_samples: Optional[int] = None,
-                      imag_horizon: Optional[int] = None,
-                      do_open_loop=False,
-                      do_image_pred=False,
-                      do_dream_tensors=False,
-                      ):
+    def training_step(self, obs: Dict[str, Tensor], in_state: Any, iwae_samples: Optional[int] = None, imag_horizon: Optional[int] = None, do_open_loop=False, do_image_pred=False, do_dream_tensors=False, ):
         assert 'action' in obs, '`action` required in observation'
         assert 'reward' in obs, '`reward` required in observation'
         assert 'reset' in obs, '`reset` required in observation'
@@ -214,6 +206,131 @@ class Dreamer(nn.Module):
 
         self.wm.requires_grad_(True)
         return features, actions, rewards, terminals
+
+    def features_from_obs_batch(self, obs: Dict[str, Tensor], in_state: Any = None):
+        T, B = obs['action'].shape[:2]
+        if in_state is None:
+            in_state = self.init_state(B)
+        
+        with torch.no_grad():
+            # Forward through world model
+            features, out_state = self.wm.forward(obs, in_state)
+            
+            # Get posterior states for dreaming
+            embed = self.wm.encoder(obs)
+            prior, post, post_samples, _, states, _ = \
+                self.wm.core.forward(embed, obs['action'], obs['reset'], in_state, iwae_samples=1)
+        
+        return features, states
+
+    def training_step_mixed(self, obs_real: Dict[str, Tensor], in_state: Any, alpha: float = 0.5, imag_ratio: float = 1.0, imag_horizon: Optional[int] = None, iwae_samples: Optional[int] = None, do_image_pred=False, do_dream_tensors=False, ):
+        assert 'action' in obs_real, '`action` required in observation'
+        assert 'reward' in obs_real, '`reward` required in observation'
+        assert 'reset' in obs_real, '`reset` required in observation'
+        assert 'terminal' in obs_real, '`terminal` required in observation'
+        
+        iwae_samples = int(iwae_samples or self.iwae_samples)
+        imag_horizon = int(imag_horizon or self.imag_horizon)
+        T, B = obs_real['action'].shape[:2]
+        I, H = iwae_samples, imag_horizon
+
+        # 1. Train world model on real data (unchanged)
+        
+        loss_model, features, states, out_state, metrics, tensors = self.wm.training_step(obs_real, in_state, iwae_samples=iwae_samples, do_open_loop=False, do_image_pred=do_image_pred)
+
+        # 2. Train probe on real data (unchanged)
+        
+        features_probe = features.detach() if not self.probe_gradients else features
+        loss_probe, metrics_probe, tensors_probe = self.probe_model.training_step(features_probe, obs_real)
+        metrics.update(**metrics_probe)
+        tensors.update(**tensors_probe)
+
+        # 3. Train Actor-Critic with mixed real + imagined experiences
+        
+        # 3a. Generate imagined experiences from real states
+        in_state_dream: StateB = map_structure(states, lambda x: flatten_batch(x.detach())[0])  # type: ignore
+        features_imag, actions_imag, rewards_imag, terminals_imag = \
+            self.dream(in_state_dream, H, self.ac.actor_grad == 'dynamics')
+        
+        # 3b. Get real experience trajectory
+        # Use the features from world model forward pass
+        features_real = features.detach()  # (T, B, I, F)
+        # Flatten for actor-critic: (T, B, I) -> (T, B*I)
+        features_real_flat = flatten_batch(features_real)[0]  # (T, TBI, F)
+        
+        # For real data from observations, we need to expand to match I dimension
+        # obs has shape (T, B), but AC expects (T, TBI) when using flattened features
+        actions_real = obs_real['action'].unsqueeze(2).expand(T, B, I, -1)  # (T, B, I, A)
+        actions_real_flat = flatten_batch(actions_real)[0]  # (T, TBI, A)
+        
+        rewards_real = obs_real['reward'].unsqueeze(2).expand(T, B, I)  # (T, B, I)
+        rewards_real_flat = flatten_batch(rewards_real)[0]  # (T, TBI)
+        
+        terminals_real = obs_real['terminal'].unsqueeze(2).expand(T, B, I)  # (T, B, I)
+        terminals_real_flat = flatten_batch(terminals_real)[0]  # (T, TBI)
+        
+        # 3c. Compute losses on real data
+        (loss_actor_real, loss_critic_real), metrics_ac_real, tensors_ac_real = \
+            self.ac.training_step(features_real_flat,
+                                 actions_real_flat[1:],  # actions[0] corresponds to transition to features[1]
+                                 rewards_real_flat,
+                                 terminals_real_flat)
+        
+        # 3d. Compute losses on imagined data
+        (loss_actor_imag, loss_critic_imag), metrics_ac_imag, tensors_ac_imag = \
+            self.ac.training_step(features_imag.detach(),
+                                 actions_imag.detach(),
+                                 rewards_imag.mean.detach(),
+                                 terminals_imag.mean.detach())
+        
+        # 3e. Mix losses according to alpha
+        loss_actor = alpha * loss_actor_real + (1 - alpha) * loss_actor_imag
+        loss_critic = alpha * loss_critic_real + (1 - alpha) * loss_critic_imag
+        
+        # Update metrics with mixed and separate losses
+        metrics.update(
+            loss_actor_real=loss_actor_real.detach(),
+            loss_actor_imag=loss_actor_imag.detach(),
+            loss_actor_mixed=loss_actor.detach(),
+            loss_critic_real=loss_critic_real.detach(),
+            loss_critic_imag=loss_critic_imag.detach(),
+            loss_critic_mixed=loss_critic.detach(),
+            alpha=alpha,
+            **{f'real_{k}': v for k, v in metrics_ac_real.items()},
+            **{f'imag_{k}': v for k, v in metrics_ac_imag.items()},
+        )
+        
+        # Use real trajectory tensors for logging
+        # tensors_ac_real['value'] has shape (T, TBI), need to unflatten to (T, B, I) then take mean over I
+        value_real = tensors_ac_real['value']  # (T, TBI)
+        if value_real.numel() > 0:
+            value_unflat = unflatten_batch(value_real, (T, B, I))  # (T, B, I)
+            tensors.update(policy_value=value_unflat.mean(-1))  # (T, B)
+        else:
+            tensors.update(policy_value=value_real)
+
+        # Dream tensors for visualization
+        dream_tensors = {}
+        if do_dream_tensors and self.wm.decoder.image is not None:
+            with torch.no_grad():
+                in_state_dream_vis: StateB = map_structure(states, lambda x: x.detach()[0, :, 0])  # (T,B,I) => (B)
+                features_dream, actions_dream, rewards_dream, terminals_dream = self.dream(in_state_dream_vis, T - 1)
+                image_dream = self.wm.decoder.image.forward(features_dream)
+                _, _, tensors_ac = self.ac.training_step(features_dream, actions_dream, rewards_dream.mean, terminals_dream.mean, log_only=True)
+                dream_tensors = dict(action_pred=torch.cat([obs_real['action'][:1], actions_dream]),
+                                    reward_pred=rewards_dream.mean,
+                                    terminal_pred=terminals_dream.mean,
+                                    image_pred=image_dream,
+                                    **tensors_ac)
+                assert dream_tensors['action_pred'].shape == obs_real['action'].shape
+                assert dream_tensors['image_pred'].shape == obs_real['image'].shape
+
+        if not self.probe_gradients:
+            losses = (loss_model, loss_probe, loss_actor, loss_critic)
+        else:
+            losses = (loss_model + loss_probe, loss_actor, loss_critic)
+        
+        return losses, out_state, metrics, tensors, dream_tensors
 
     def __str__(self):
         # Short representation

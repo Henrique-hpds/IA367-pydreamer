@@ -119,6 +119,20 @@ defaults:
   env_time_limit: 0
   env_no_terminal: False
 
+  # A2C-DreamerMix (distributed + imagined replay)
+  dreamermix:
+    num_collectors: 4             # Number of parallel environment collectors
+    replay_size: 5000             # Maximum number of sequences in replay buffer
+    batch_T: 50                   # Sequence length for training
+    batch_B: 8                    # Batch size for training
+    imag_ratio: 1.0               # Ratio of imagined to real experiences
+    imag_horizon: 15              # Horizon for imagined rollouts
+    alpha_init: 1.0               # Initial mixing coefficient (1.0 = all real)
+    alpha_final: 0.1              # Final mixing coefficient (0.1 = mostly imagined)
+    alpha_tau: 100000.0           # Decay rate for alpha scheduler
+    use_vtrace: false             # Use V-trace for off-policy correction (optional)
+    collector_steps_per_send: 50  # Steps each collector accumulates before sending
+
 minigrid:
   env_id: MiniGrid-MazeS11N-v0
   # Features
