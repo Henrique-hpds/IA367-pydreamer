@@ -20,10 +20,8 @@ class ActorCritic(nn.Module):
                  lambda_gae=0.95,
                  entropy_weight=1e-3,
                  target_interval=100,
-                 actor_grad='ppo',
-                 actor_dist='onehot',
-                 ppo_clip_eps=0.2,
-                 ppo_epochs=1
+                 actor_grad='reinforce',
+                 actor_dist='onehot'
                  ):
         super().__init__()
         self.in_dim = in_dim
@@ -34,8 +32,6 @@ class ActorCritic(nn.Module):
         self.target_interval = target_interval
         self.actor_grad = actor_grad
         self.actor_dist = actor_dist
-        self.ppo_clip_eps = ppo_clip_eps
-        self.ppo_epochs = ppo_epochs
 
         actor_out_dim = out_actions if actor_dist == 'onehot' else 2 * out_actions
         self.actor = MLP(in_dim, actor_out_dim, hidden_dim, hidden_layers, layer_norm)
@@ -43,13 +39,6 @@ class ActorCritic(nn.Module):
         self.critic_target = MLP(in_dim, 1, hidden_dim, hidden_layers, layer_norm)
         self.critic_target.requires_grad_(False)
         self.train_steps = 0
-
-    def ppo_clip_loss(self, logp_old, logp_new, advantages, clip_eps=0.2):
-        ratio = torch.exp(logp_new - logp_old)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * advantages
-        return -torch.min(surr1, surr2)
-
 
     def forward_actor(self, features: Tensor) -> D.Distribution:
         y = self.actor.forward(features).float()  # .float() to force float32 on AMP
@@ -74,7 +63,6 @@ class ActorCritic(nn.Module):
                       actions: TensorHMA,
                       rewards: TensorJM,
                       terminals: TensorJM,
-                      logp_old: TensorHMA,
                       log_only=False
                       ):
         """
@@ -85,10 +73,6 @@ class ActorCritic(nn.Module):
             ...
             -> actions[H-1] -> rewards[H], terminals[H], features[H]
         """
-
-        assert logp_old.shape == actions.shape[:2]
-
-
         if not log_only:
             if self.train_steps % self.target_interval == 0:
                 self.update_critic_target()
@@ -130,27 +114,10 @@ class ActorCritic(nn.Module):
         loss_critic = 0.5 * torch.square(value_target.detach() - value0)
         loss_critic = (loss_critic * reality_weight).mean()
 
-        # Normalize advantage (optional but recommended for PPO)
-        adv_norm = advantage_gae.detach()
-        adv_norm = (adv_norm - adv_norm.mean()) / (adv_norm.std(unbiased=False) + 1e-8)
-
         # Actor loss
 
         policy_distr = self.forward_actor(features[:-1])  # TODO: we could reuse this from dream()
-
-
-        if self.actor_grad == 'ppo':
-
-            logp_new = policy_distr.log_prob(actions)
-
-            loss_policy = self.ppo_clip_loss(
-                logp_old=logp_old,
-                logp_new=logp_new,
-                advantages=adv_norm,
-                clip_eps=self.ppo_clip_eps
-            )
-
-        elif self.actor_grad == 'reinforce':
+        if self.actor_grad == 'reinforce':
             action_logprob = policy_distr.log_prob(actions)
             loss_policy = - action_logprob * advantage_gae.detach()
         elif self.actor_grad == 'dynamics':

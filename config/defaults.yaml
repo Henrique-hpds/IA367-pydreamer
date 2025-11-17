@@ -96,7 +96,7 @@ defaults:
   entropy: 0.003
   target_interval: 100
   imag_horizon: 15
-  actor_grad: ppo
+  actor_grad: reinforce
   actor_dist: onehot
 
   # Auxiliary Actor critic
