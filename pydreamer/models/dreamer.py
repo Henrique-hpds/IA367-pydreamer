@@ -123,6 +123,7 @@ class Dreamer(nn.Module):
         assert 'reward' in obs, '`reward` required in observation'
         assert 'reset' in obs, '`reset` required in observation'
         assert 'terminal' in obs, '`terminal` required in observation'
+
         iwae_samples = int(iwae_samples or self.iwae_samples)
         imag_horizon = int(imag_horizon or self.imag_horizon)
         T, B = obs['action'].shape[:2]
@@ -148,13 +149,14 @@ class Dreamer(nn.Module):
 
         in_state_dream: StateB = map_structure(states, lambda x: flatten_batch(x.detach())[0])  # type: ignore  # (T,B,I) => (TBI)
         # Note features_dream includes the starting "real" features at features_dream[0]
-        features_dream, actions_dream, rewards_dream, terminals_dream = \
+        features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream = \
             self.dream(in_state_dream, H, self.ac.actor_grad == 'dynamics')  # (H+1,TBI,D)
         (loss_actor, loss_critic), metrics_ac, tensors_ac = \
             self.ac.training_step(features_dream.detach(),
                                   actions_dream.detach(),
-                                  rewards_dream.mean.detach(),
-                                  terminals_dream.mean.detach())
+                                  rewards_dream.detach(), #maybe rewards_dream.mean.detach()
+                                  terminals_dream.detach(), #maybe terminals_dream.mean.detach()
+                                  logp_dream.detach())
         metrics.update(**metrics_ac)
         tensors.update(policy_value=unflatten_batch(tensors_ac['value'][0], (T, B, I)).mean(-1))
 
@@ -167,9 +169,9 @@ class Dreamer(nn.Module):
                 # and here for inspection purposes we only dream from first step, so it's (H*B).
                 # Oh, and we set here H=T-1, so we get (T,B), and the dreamed experience aligns with actual.
                 in_state_dream: StateB = map_structure(states, lambda x: x.detach()[0, :, 0])  # type: ignore  # (T,B,I) => (B)
-                features_dream, actions_dream, rewards_dream, terminals_dream = self.dream(in_state_dream, T - 1)  # H = T-1
+                features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream = self.dream(in_state_dream, T - 1)  # H = T-1
                 image_dream = self.wm.decoder.image.forward(features_dream)
-                _, _, tensors_ac = self.ac.training_step(features_dream, actions_dream, rewards_dream.mean, terminals_dream.mean, log_only=True)
+                _, _, tensors_ac = self.ac.training_step(features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream, log_only=True) #maybe rewards_dream.mean and terminals_dream.mean
                 # The tensors are intentionally named same as in tensors, so the logged npz looks the same for dreamed or not
                 dream_tensors = dict(action_pred=torch.cat([obs['action'][:1], actions_dream]),  # first action is real from previous step
                                      reward_pred=rewards_dream.mean,
@@ -188,6 +190,7 @@ class Dreamer(nn.Module):
     def dream(self, in_state: StateB, imag_horizon: int, dynamics_gradients=False):
         features = []
         actions = []
+        logps = []
         state = in_state
         self.wm.requires_grad_(False)  # Prevent dynamics gradiens from affecting world model
 
@@ -198,8 +201,14 @@ class Dreamer(nn.Module):
                 action = action_dist.rsample()
             else:
                 action = action_dist.sample()
+
+            logp = action_dist.log_prob(action)
+            if logp.dim() > 1:  # e.g. continuous multi-dim action -> sum dims
+                logp = logp.sum(dim=-1)
+
             features.append(feature)
             actions.append(action)
+            logps.append(logp)
             # When using dynamics gradients, this causes gradients in RSSM, which we don't want.
             # This is handled in backprop - the optimizer_model will ignore gradients from loss_actor.
             _, state = self.wm.core.cell.forward_prior(action, None, state)
@@ -208,12 +217,13 @@ class Dreamer(nn.Module):
         features.append(feature)
         features = torch.stack(features)  # (H+1,TBI,D)
         actions = torch.stack(actions)  # (H,TBI,A)
+        logps = torch.stack(logps)
 
         rewards = self.wm.decoder.reward.forward(features)      # (H+1,TBI)
         terminals = self.wm.decoder.terminal.forward(features)  # (H+1,TBI)
 
         self.wm.requires_grad_(True)
-        return features, actions, rewards, terminals
+        return features, actions, rewards, terminals, logps
 
     def __str__(self):
         # Short representation
