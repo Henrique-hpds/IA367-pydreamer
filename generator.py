@@ -148,11 +148,13 @@ def main(env_id='MiniGrid-MazeS11N-v0',
             data['policy_value'] = np.array(metrics['policy_value'] + [np.nan])     # last terminal value is null
             data['policy_entropy'] = np.array(metrics['policy_entropy'] + [np.nan])  # last policy is null
             data['action_prob'] = np.array([np.nan] + metrics['action_prob'])       # first action is null
+            data['action_logp'] = np.array([np.nan] + metrics['action_logp'])      # store per-step log-prob from policy
         else:
             # Need to fill with placeholders, so all batches have the same keys
             data['policy_value'] = np.full(data['reward'].shape, np.nan)
             data['policy_entropy'] = np.full(data['reward'].shape, np.nan)
             data['action_prob'] = np.full(data['reward'].shape, np.nan)
+            data['action_logp'] = np.full(data['reward'].shape, np.nan)
 
         # Log
 
@@ -334,9 +336,15 @@ class NetworkPolicy:
             action = action_distr.sample()
             self.state = new_state
 
+        # Compute per-step log probability (sum over action dims if needed) and expose it
+        logp = action_distr.log_prob(action)
+        if logp.dim() > 1:
+            logp = logp.sum(dim=-1)
+        # Convert tensors/metrics to python scalars for generator logging
         metrics = {k: v.item() for k, v in metrics.items()}
-        metrics.update(action_prob=action_distr.log_prob(action).exp().mean().item(),
-                       policy_entropy=action_distr.entropy().mean().item())
+        metrics.update(action_logp=logp.item(),
+                       action_prob=float(torch.exp(logp).mean().item()),
+                       policy_entropy=float(action_distr.entropy().mean().item()))
 
         action = action.squeeze()  # (1,1,A) => A
         return action.numpy(), metrics

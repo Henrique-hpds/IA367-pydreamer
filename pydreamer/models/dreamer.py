@@ -20,6 +20,8 @@ class Dreamer(nn.Module):
 
     def __init__(self, conf):
         super().__init__()
+        # Keep a reference to configuration for behavior toggles (e.g. PPO on-policy)
+        self.conf = conf
         assert conf.action_dim > 0, "Need to set action_dim to match environment"
         features_dim = conf.deter_dim + conf.stoch_dim * (conf.stoch_discrete or 1)
         self.iwae_samples = conf.iwae_samples
@@ -58,17 +60,31 @@ class Dreamer(nn.Module):
         self.probe_gradients = conf.probe_gradients
 
     def init_optimizers(self, lr, lr_actor=None, lr_critic=None, eps=1e-5):
+        # Always create actor/critic optimizers and store them so Dreamer can perform
+        # on-policy PPO updates internally if requested.
+        optimizer_wm = torch.optim.AdamW(self.wm.parameters(), lr=lr, eps=eps)
+        optimizer_probe = torch.optim.AdamW(self.probe_model.parameters(), lr=lr, eps=eps) if not self.probe_gradients else None
+        optimizer_actor = torch.optim.AdamW(self.ac.actor.parameters(), lr=lr_actor or lr, eps=eps)
+        optimizer_critic = torch.optim.AdamW(self.ac.critic.parameters(), lr=lr_critic or lr, eps=eps)
+
+        # Save references for on-policy PPO updates
+        self.optimizer_actor = optimizer_actor
+        self.optimizer_critic = optimizer_critic
+
+        # If probe gradients are enabled we merge wm+probe optimizer
         if not self.probe_gradients:
-            optimizer_wm = torch.optim.AdamW(self.wm.parameters(), lr=lr, eps=eps)
-            optimizer_probe = torch.optim.AdamW(self.probe_model.parameters(), lr=lr, eps=eps)
-            optimizer_actor = torch.optim.AdamW(self.ac.actor.parameters(), lr=lr_actor or lr, eps=eps)
-            optimizer_critic = torch.optim.AdamW(self.ac.critic.parameters(), lr=lr_critic or lr, eps=eps)
-            return optimizer_wm, optimizer_probe, optimizer_actor, optimizer_critic
+            # If PPO on-policy is enabled, do not return actor/critic optimizers so
+            # train.py won't step them (we'll update them inside Dreamer.training_step).
+            if getattr(self, 'conf', None) and getattr(self.conf, 'ppo_on_policy', False):
+                return optimizer_wm, optimizer_probe
+            else:
+                return optimizer_wm, optimizer_probe, optimizer_actor, optimizer_critic
         else:
             optimizer_wmprobe = torch.optim.AdamW(self.wm.parameters(), lr=lr, eps=eps)
-            optimizer_actor = torch.optim.AdamW(self.ac.actor.parameters(), lr=lr_actor or lr, eps=eps)
-            optimizer_critic = torch.optim.AdamW(self.ac.critic.parameters(), lr=lr_critic or lr, eps=eps)
-            return optimizer_wmprobe, optimizer_actor, optimizer_critic
+            if getattr(self, 'conf', None) and getattr(self.conf, 'ppo_on_policy', False):
+                return optimizer_wmprobe,
+            else:
+                return optimizer_wmprobe, optimizer_actor, optimizer_critic
 
     def grad_clip(self, grad_clip, grad_clip_ac=None):
         if not self.probe_gradients:
@@ -146,19 +162,72 @@ class Dreamer(nn.Module):
         tensors.update(**tensors_probe)
 
         # Policy
+        # Two options for actor training:
+        # 1) Imagined rollouts (original Dreamer-style) - keep existing `dream()` path
+        # 2) On-policy PPO training from real trajectories collected by generators
+        if getattr(self.conf, 'ppo_on_policy', False) and self.ac.actor_grad == 'ppo':
+            # On-policy PPO: perform multi-epoch minibatch updates using real features + stored action log-probs.
+            features_real = features.select(2, 0)  # (T+1, B, D)
+            logp_old = obs.get('action_logp')
+            if logp_old is None:
+                # Fallback: reconstruct old log-probs from the current policy (approximate).
+                # This allows training to continue with older episodes that lack stored `action_logp`.
+                # Compute policy distribution on real features and evaluate log_prob of actions.
+                # features_real[:-1] corresponds to states before actions[0..T-1]
+                with torch.no_grad():
+                    policy_distr_fallback = self.ac.forward_actor(features_real[:-1])
+                    logp_fb = policy_distr_fallback.log_prob(obs['action'][1:])
+                    if logp_fb.dim() > 1:
+                        logp_fb = logp_fb.sum(dim=-1)
+                    logp_old = logp_fb.detach()
 
-        in_state_dream: StateB = map_structure(states, lambda x: flatten_batch(x.detach())[0])  # type: ignore  # (T,B,I) => (TBI)
-        # Note features_dream includes the starting "real" features at features_dream[0]
-        features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream = \
-            self.dream(in_state_dream, H, self.ac.actor_grad == 'dynamics')  # (H+1,TBI,D)
-        (loss_actor, loss_critic), metrics_ac, tensors_ac = \
-            self.ac.training_step(features_dream.detach(),
-                                  actions_dream.detach(),
-                                  rewards_dream.detach(), #maybe rewards_dream.mean.detach()
-                                  terminals_dream.detach(), #maybe terminals_dream.mean.detach()
-                                  logp_dream.detach())
+            # Use stored actor/critic optimizers created in init_optimizers
+            ppo_epochs = getattr(self.conf, 'ppo_epochs', self.ac.ppo_epochs)
+            minibatch = getattr(self.conf, 'ppo_minibatch_size', None)
+
+            metrics_ac, tensors_ac = self.ac.ppo_update(
+                features_real.detach(),
+                obs['action'][1:].detach(),
+                obs['reward'].detach(),
+                obs['terminal'].detach(),
+                logp_old[1:].detach(),
+                optimizer_actor=getattr(self, 'optimizer_actor', None),
+                optimizer_critic=getattr(self, 'optimizer_critic', None),
+                ppo_epochs=ppo_epochs,
+                minibatch_size=minibatch,
+            )
+
+            # We already applied actor/critic updates inside ppo_update, so return
+            # zero losses that require gradients to keep the training loop happy
+            # (train.py expects all returned losses to support backward()).
+            loss_actor = torch.tensor(0.0, device=features.device, requires_grad=True)
+            loss_critic = torch.tensor(0.0, device=features.device, requires_grad=True)
+        else:
+            # Imagined rollouts (original behavior)
+            in_state_dream: StateB = map_structure(states, lambda x: flatten_batch(x.detach())[0])  # type: ignore  # (T,B,I) => (TBI)
+            # Note features_dream includes the starting "real" features at features_dream[0]
+            features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream = \
+                self.dream(in_state_dream, H, self.ac.actor_grad == 'dynamics')  # (H+1,TBI,D)
+            # rewards_dream and terminals_dream are distributions; extract means
+            rewards_mean = rewards_dream.mean.detach() if hasattr(rewards_dream, 'mean') else rewards_dream.detach()
+            terminals_mean = terminals_dream.mean.detach() if hasattr(terminals_dream, 'mean') else terminals_dream.detach()
+            (loss_actor, loss_critic), metrics_ac, tensors_ac = \
+                self.ac.training_step(features_dream.detach(),
+                                      actions_dream.detach(),
+                                      rewards_mean,
+                                      terminals_mean,
+                                      logp_dream.detach())
         metrics.update(**metrics_ac)
-        tensors.update(policy_value=unflatten_batch(tensors_ac['value'][0], (T, B, I)).mean(-1))
+        # For on-policy PPO: value shape is (T+1, B, 1), take first timestep and unflatten
+        if getattr(self.conf, 'ppo_on_policy', False) and self.ac.actor_grad == 'ppo':
+            # value[0] has shape (B, 1), squeeze to (B), then reshape to (T//... B, I...)
+            value_b = tensors_ac['value'][0].squeeze(-1)  # (B,)
+            # Broadcast back: we need to unflatten a single value per batch elem to policy_value shape (T, B, I)
+            # Policy value should have shape (T, B, I) - just take the first timestep value for all
+            tensors.update(policy_value=unflatten_batch(value_b, (1, B, I)).expand(T, B, I))
+        else:
+            # For imagined rollout: value shape is (H+1, TBI, 1), already handled by existing logic
+            tensors.update(policy_value=unflatten_batch(tensors_ac['value'][0], (T, B, I)).mean(-1))
 
         # Dream for a log sample.
 
@@ -171,11 +240,14 @@ class Dreamer(nn.Module):
                 in_state_dream: StateB = map_structure(states, lambda x: x.detach()[0, :, 0])  # type: ignore  # (T,B,I) => (B)
                 features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream = self.dream(in_state_dream, T - 1)  # H = T-1
                 image_dream = self.wm.decoder.image.forward(features_dream)
-                _, _, tensors_ac = self.ac.training_step(features_dream, actions_dream, rewards_dream, terminals_dream, logp_dream, log_only=True) #maybe rewards_dream.mean and terminals_dream.mean
+                # Extract means from distributions for logging
+                rewards_mean_dream = rewards_dream.mean if hasattr(rewards_dream, 'mean') else rewards_dream
+                terminals_mean_dream = terminals_dream.mean if hasattr(terminals_dream, 'mean') else terminals_dream
+                _, _, tensors_ac = self.ac.training_step(features_dream, actions_dream, rewards_mean_dream, terminals_mean_dream, logp_dream, log_only=True)
                 # The tensors are intentionally named same as in tensors, so the logged npz looks the same for dreamed or not
                 dream_tensors = dict(action_pred=torch.cat([obs['action'][:1], actions_dream]),  # first action is real from previous step
-                                     reward_pred=rewards_dream.mean,
-                                     terminal_pred=terminals_dream.mean,
+                                     reward_pred=rewards_mean_dream,
+                                     terminal_pred=terminals_mean_dream,
                                      image_pred=image_dream,
                                      **tensors_ac)
                 assert dream_tensors['action_pred'].shape == obs['action'].shape

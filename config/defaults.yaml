@@ -98,6 +98,12 @@ defaults:
   imag_horizon: 15
   actor_grad: ppo
   actor_dist: onehot
+  # If true and `actor_grad`=='ppo', use on-policy PPO from real env trajectories
+  # (requires `generator` to save `action_logp` per step). Otherwise uses imagined rollouts.
+  ppo_on_policy: False
+  # PPO training parameters (only used when `ppo_on_policy`=True)
+  ppo_epochs: 4
+  ppo_minibatch_size: 256
 
   # Auxiliary Actor critic
   aux_critic: False

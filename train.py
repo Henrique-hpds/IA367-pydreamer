@@ -138,7 +138,7 @@ def run(conf):
     data_iter = iter(DataLoader(WorkerInfoPreprocess(preprocess(data)),
                                 batch_size=None,
                                 num_workers=conf.data_workers,
-                                prefetch_factor=20 if conf.data_workers else 2,  # GCS download has to be shorter than this many batches (e.g. 1sec < 20*300ms)
+                                prefetch_factor=20 if conf.data_workers > 0 else None,  # GCS download has to be shorter than this many batches (e.g. 1sec < 20*300ms)
                                 pin_memory=True))
 
     scaler = GradScaler(enabled=conf.amp)

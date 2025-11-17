@@ -45,7 +45,9 @@ class ActorCritic(nn.Module):
         self.train_steps = 0
 
     def ppo_clip_loss(self, logp_old, logp_new, advantages, clip_eps=0.2):
-        ratio = torch.exp(logp_new - logp_old)
+        # Clamp log probability difference to prevent numerical instability
+        log_ratio = torch.clamp(logp_new - logp_old, min=-5.0, max=5.0)
+        ratio = torch.exp(log_ratio)
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * advantages
         return -torch.min(surr1, surr2)
@@ -53,6 +55,8 @@ class ActorCritic(nn.Module):
 
     def forward_actor(self, features: Tensor) -> D.Distribution:
         y = self.actor.forward(features).float()  # .float() to force float32 on AMP
+        # Clamp logits to prevent overflow in distribution
+        y = torch.clamp(y, min=-10.0, max=10.0)
 
         if self.actor_dist == 'onehot':
             return D.OneHotCategorical(logits=y)
@@ -180,6 +184,139 @@ class ActorCritic(nn.Module):
                            )
 
         return (loss_actor, loss_critic), metrics, tensors
+
+    def ppo_update(self,
+                   features: TensorJMF,
+                   actions: TensorHMA,
+                   rewards: TensorJM,
+                   terminals: TensorJM,
+                   logp_old: TensorHMA,
+                   optimizer_actor: torch.optim.Optimizer,
+                   optimizer_critic: torch.optim.Optimizer,
+                   ppo_epochs: int = None,
+                   minibatch_size: int = None):
+        """
+        Perform multi-epoch PPO updates with minibatching.
+        `features` shape: (T+1, B, F)
+        `actions` shape: (T, B, A) or (T, B)
+        `logp_old` shape: (T, B)
+        Returns: averaged metrics dict and tensors (for logging)
+        """
+        ppo_epochs = int(ppo_epochs or self.ppo_epochs)
+
+        # Compute value targets and advantages using current critic target (same as training_step)
+        reward1: TensorHM = rewards[1:]
+        terminal1: TensorHM = terminals[1:]
+        # Values from critic target
+        with torch.no_grad():
+            value_t: TensorJM = self.critic_target.forward(features)
+        value0t: TensorHM = value_t[:-1]
+        value1t: TensorHM = value_t[1:]
+        advantage = - value0t + reward1 + self.gamma * (1.0 - terminal1) * value1t
+        # GAE
+        advantage_gae = []
+        agae = None
+        for adv, term in zip(reversed(advantage.unbind()), reversed(terminal1.unbind())):
+            if agae is None:
+                agae = adv
+            else:
+                agae = adv + self.lambda_ * self.gamma * (1.0 - term) * agae
+            advantage_gae.append(agae)
+        advantage_gae.reverse()
+        advantage_gae = torch.stack(advantage_gae)
+        value_target = advantage_gae + value0t
+
+        # Reality weight
+        terminal0: TensorHM = terminals[:-1]
+        reality_weight = (1 - terminal0).log().cumsum(dim=0).exp()
+
+        # Normalize advantage
+        adv_norm = advantage_gae.detach()
+        adv_norm = (adv_norm - adv_norm.mean()) / (adv_norm.std(unbiased=False) + 1e-8)
+
+        # Prepare flattened minibatch (T,B) -> (N,)
+        # Policy inputs correspond to features[:-1]
+        feat_policy = features[:-1]
+        # Flatten first two dims
+        N = feat_policy.shape[0] * feat_policy.shape[1]
+        feat_flat = feat_policy.reshape(-1, feat_policy.shape[-1])  # (N, F)
+        actions_flat = actions.reshape(-1, *actions.shape[2:]) if actions.dim() > 2 else actions.reshape(-1)
+        logp_old_flat = logp_old.reshape(-1)
+        adv_flat = adv_norm.reshape(-1)
+        value_target_flat = value_target.reshape(-1)
+        reality_flat = reality_weight.reshape(-1)
+
+        minibatch_size = int(minibatch_size or max(1, N // 4))
+        minibatch_size = min(minibatch_size, N)
+
+        # Metrics accumulators
+        acc_actor_loss = 0.0
+        acc_critic_loss = 0.0
+        acc_entropy = 0.0
+        acc_updates = 0
+
+        for epoch in range(ppo_epochs):
+            perm = torch.randperm(N, device=feat_flat.device)
+            for start in range(0, N, minibatch_size):
+                idx = perm[start:start + minibatch_size]
+                f_mb = feat_flat[idx]
+                a_mb = actions_flat[idx]
+                logp_old_mb = logp_old_flat[idx]
+                adv_mb = adv_flat[idx]
+                vt_mb = value_target_flat[idx]
+                rw_mb = reality_flat[idx]
+
+                # Actor
+                optimizer_actor.zero_grad()
+                policy_distr = self.forward_actor(f_mb)
+                logp_new = policy_distr.log_prob(a_mb)
+                if logp_new.dim() > 1:
+                    logp_new = logp_new.sum(dim=-1)
+                # PPO clipped surrogate
+                loss_policy = self.ppo_clip_loss(logp_old_mb, logp_new, adv_mb, clip_eps=self.ppo_clip_eps)
+                entropy = policy_distr.entropy()
+                if entropy.dim() > 1:
+                    entropy = entropy.mean(dim=-1)
+                loss_actor_mb = (loss_policy - self.entropy_weight * entropy) * rw_mb
+                loss_actor = loss_actor_mb.mean()
+                loss_actor.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                optimizer_actor.step()
+
+                # Critic
+                optimizer_critic.zero_grad()
+                value_pred = self.critic.forward(f_mb)
+                # value_pred may be shape (M,) already due to MLP flatten; ensure 1D
+                value_pred_flat = value_pred.reshape(-1)
+                loss_critic_mb = 0.5 * torch.square(vt_mb.detach() - value_pred_flat)
+                loss_critic = (loss_critic_mb * rw_mb).mean()
+                loss_critic.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                optimizer_critic.step()
+
+                # Accumulate metrics
+                acc_actor_loss += float(loss_actor.detach().cpu().item())
+                acc_critic_loss += float(loss_critic.detach().cpu().item())
+                acc_entropy += float(entropy.mean().detach().cpu().item()) if entropy.numel() else 0.0
+                acc_updates += 1
+
+        dev = next(self.actor.parameters()).device
+        if acc_updates == 0:
+            metrics_zero = {k: torch.tensor(v, device=dev) for k, v in {'loss_actor': 0.0, 'loss_critic': 0.0, 'policy_entropy': 0.0}.items()}
+            return metrics_zero, {'value': value_t.detach(), 'value_target': value_target.detach()}
+
+        # Update critic target network after PPO updates
+        self.update_critic_target()
+
+        metrics = {
+            'loss_actor': acc_actor_loss / acc_updates,
+            'loss_critic': acc_critic_loss / acc_updates,
+            'policy_entropy': acc_entropy / acc_updates,
+        }
+        # Convert metrics to tensors on the correct device so training loop can .item() them
+        metrics = {k: torch.tensor(float(v), device=dev) for k, v in metrics.items()}
+        tensors = {'value': value_t.detach(), 'value_target': value_target.detach(), 'value_advantage_gae': advantage_gae.detach()}
+        return metrics, tensors
 
     def update_critic_target(self):
         self.critic_target.load_state_dict(self.critic.state_dict())  # type: ignore
