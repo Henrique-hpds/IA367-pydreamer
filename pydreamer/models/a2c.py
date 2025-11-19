@@ -204,6 +204,10 @@ class ActorCritic(nn.Module):
         """
         ppo_epochs = int(ppo_epochs or self.ppo_epochs)
 
+        # Initialize critic_target on first ppo_update call (to match current critic weights)
+        if self.train_steps == 0:
+            self.update_critic_target()
+
         # Compute value targets and advantages using current critic target (same as training_step)
         reward1: TensorHM = rewards[1:]
         terminal1: TensorHM = terminals[1:]
@@ -305,16 +309,20 @@ class ActorCritic(nn.Module):
             metrics_zero = {k: torch.tensor(v, device=dev) for k, v in {'loss_actor': 0.0, 'loss_critic': 0.0, 'policy_entropy': 0.0}.items()}
             return metrics_zero, {'value': value_t.detach(), 'value_target': value_target.detach()}
 
-        # Update critic target network after PPO updates
-        self.update_critic_target()
+        # Update critic target network after PPO updates (only if enough training steps have passed)
+        if self.train_steps % self.target_interval == 0:
+            self.update_critic_target()
+        self.train_steps += 1
 
         metrics = {
             'loss_actor': acc_actor_loss / acc_updates,
             'loss_critic': acc_critic_loss / acc_updates,
             'policy_entropy': acc_entropy / acc_updates,
+            'policy_value': value_t[0].detach().mean(),  # Use first timestep value for logging
         }
         # Convert metrics to tensors on the correct device so training loop can .item() them
-        metrics = {k: torch.tensor(float(v), device=dev) for k, v in metrics.items()}
+        metrics = {k: torch.tensor(float(v.item() if hasattr(v, 'item') else v), device=dev) for k, v in metrics.items()}
+        
         tensors = {'value': value_t.detach(), 'value_target': value_target.detach(), 'value_advantage_gae': advantage_gae.detach()}
         return metrics, tensors
 
