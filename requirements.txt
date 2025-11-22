@@ -12,6 +12,15 @@ notebook
 holoviews
 imageio
 
+# Data analysis and visualization
+numpy
+pandas
+matplotlib
+seaborn
+
+# Configuration
+munch
+
 # Logging
 mlflow
 google.cloud.storage
